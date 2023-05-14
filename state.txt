@@ -1,0 +1,538 @@
+--- generator.py ---
+from tree_parser import VarDeclaration, PrintStatement, BinaryOperation, IfStatement
+import platform
+
+def generate_code_x86(node, variables, counter):
+    if isinstance(node, VarDeclaration):
+        variables[node.name] = node.value.value
+        return ""
+    elif isinstance(node, PrintStatement):
+        counter['print'] += 1
+        print_id = counter['print']     # get the current print count
+        if isinstance(node.expression, BinaryOperation):
+            left = variables[node.expression.left.name]
+            right = variables[node.expression.right.name]
+            # Note that for division, the above implementation does not handle the remainder, 
+            # and it assumes integer division. To support floating-point numbers and arithmetic, 
+            # we'll need to extend the language and the code generator accordingly.
+            operation = {
+                '+': 'add',
+                '-': 'sub',
+                '*': 'imul',
+                '/': 'idiv'
+            }[node.expression.operator]
+            return f"""
+section .data
+    result{print_id} dq 0
+    format{print_id} db "%d", 10, 0
+
+section .text
+    extern printf
+
+print{print_id}:
+    sub rsp, 8
+    mov rax, {left}
+    {operation} rax, {right}
+    mov [result{print_id}], rax
+    mov rdi, format{print_id}
+    mov rsi, [result{print_id}]
+    xor rax, rax
+    call printf
+    xor eax, eax
+    add rsp, 8
+    ret
+"""
+        else:
+            value = variables[node.expression.name]
+            return f"""
+section .data
+    result dq {value}
+    format db "%d", 10, 0
+
+section .text
+    global main
+    extern printf
+
+main:
+    sub rsp, 8
+    mov rdi, format
+    mov rsi, [result]
+    xor rax, rax
+    call printf
+    xor eax, eax
+    add rsp, 8
+    ret
+"""
+    else:
+        raise NotImplementedError(f"Code generation not implemented for this node type: {node.__class__}")
+
+def generate_code_arm(node, variables, counter):
+    if isinstance(node, VarDeclaration):
+        variables[node.name] = node.value.value
+        return ""
+    elif isinstance(node, PrintStatement):
+        counter['print'] += 1
+        print_id = counter['print']
+        if isinstance(node.expression, BinaryOperation):
+            left = variables[node.expression.left.name]
+            right = variables[node.expression.right.name]
+            operation = {
+                '+': 'add',
+                '-': 'sub',
+                '*': 'mul',
+                '/': 'sdiv'
+            }[node.expression.operator]
+            return f"""
+.data
+    result{print_id}: .word 0
+    format{print_id}: .asciz "%d\\n"
+
+.text
+    .globl print{print_id}
+
+print{print_id}:
+    push {{lr}}
+    mov r0, #{left}
+    mov r1, #{right}
+    {operation} r0, r0, r1
+    str r0, [result{print_id}]
+    ldr r0, =format{print_id}
+    ldr r1, [result{print_id}]
+    bl printf
+    pop {{lr}}
+    bx lr
+"""       
+        else:
+            value = variables[node.expression.name]
+            if f'format{value}' not in print_calls:
+                print_calls[f'format{value}'] = f"""
+section .data
+    format{value} db "%d", 10, 0
+"""
+            return f"""
+section .text
+    extern printf
+
+main:
+    sub rsp, 8
+    mov rdi, format{value}
+    mov rsi, {value}
+    xor rax, rax
+    call printf
+    xor eax, eax
+    add rsp, 8
+    ret
+"""
+    
+    elif isinstance(node, IfStatement):
+        # Generate the code for if statement
+        # ...
+        return f""""""
+
+    else:
+        raise NotImplementedError(f"Code generation not implemented for this node type: {node.__class__}")
+
+def generate_assembly_x86(syntax_tree):
+    variables = {}
+    assembly_code = ""
+    counter = {'print': 0}
+    print_calls = [] # to store print function calls
+    for node in syntax_tree:
+        assembly_code += generate_code_x86(node, variables, counter)
+        if isinstance(node, PrintStatement):
+            print_calls.append(f"call print{counter['print']}")
+
+    print_line = '\n '.join(print_calls)
+    main_function = f"""
+section .text
+    global main
+    extern printf
+
+main:
+    sub rsp, 8
+    {print_line}
+    xor eax, eax
+    add rsp, 8
+    ret
+"""
+
+    return main_function + assembly_code
+
+def generate_assembly_arm(syntax_tree):
+    variables = {}
+    assembly_code = ""
+    counter = {'print': 0}
+    print_calls = []
+    for node in syntax_tree:
+        assembly_code += generate_code_arm(node, variables, counter)
+        if isinstance(node, PrintStatement):
+            print_calls.append(f"bl print{counter['print']}")
+
+    print_line = '\n '.join(print_calls)
+    main_function = f"""
+.text
+    .globl main
+
+main:
+    push {{lr}}
+    {print_line}
+    pop {{lr}}
+    bx lr
+"""
+
+    return main_function + assembly_code
+
+def generate_assembly(syntax_tree):
+    architecture = platform.machine()
+    if architecture == "x86_64":
+        print("x86 detected")
+        return generate_assembly_x86(syntax_tree)
+    elif architecture.startswith("arm") or architecture.startswith("aarch"):
+        print("arm detected")
+        return generate_assembly_arm(syntax_tree)
+    else:
+        raise NotImplementedError(f"Code generation not implemented for this architecture: {architecture}")
+
+--- clam.py ---
+import sys
+import subprocess
+import os
+import datetime
+import platform
+from lexer import lex
+from tree_parser import parse
+from generator import generate_assembly
+import tiktoken
+import traceback
+import openai
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+def get_file_content(file_path: str):
+    with open(file_path, 'r') as f:
+        return f.read()
+
+def write_state_file(build_successful: bool, output_messages: str, command: str):
+    current_datetime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    build_status = "successful" if build_successful else "failed"
+
+    uname_output = subprocess.run(['uname', '-a'], capture_output=True, text=True).stdout.strip()
+
+    state_content = ""
+
+    for file_name in os.listdir('.'):
+        if file_name.endswith('.py') or file_name.endswith('.clam'):
+            state_content += f"--- {file_name} ---\n"
+            state_content += get_file_content(file_name)
+            state_content += "\n\n"
+
+    state_content += f"Extra information:\n"
+    state_content += f"Output of 'uname -a': {uname_output}\n"
+    state_content += f"Current datetime: {current_datetime}\n\n"
+
+    state_content += f"Command used: {command}\n\n"
+
+    state_content += f"Build status: {build_status}\n"
+    state_content += f"Build datetime: {current_datetime}\n\n"
+    state_content += f"Output messages:\n{output_messages}\n\n"
+
+    with open("state.txt", "w") as f:
+        f.write(state_content)
+
+def compile_clam_file(input_file: str, output_file: str, command: str):
+    try:
+        with open(input_file, 'r') as f:
+            source_code = f.read()
+
+        tokens = lex(source_code)
+        syntax_tree = parse(tokens)
+        assembly_code = generate_assembly(syntax_tree)
+
+        assembly_file = input_file.replace('.clam', '.s')
+        with open(assembly_file, 'w') as f:
+            f.write(assembly_code)
+
+        obj_file = input_file.replace('.clam', '.o')
+
+        assembler = "gcc" if platform.machine().startswith("arm") or platform.machine().startswith("aarch") else "nasm"
+
+        if assembler == "gcc":
+            assembler_flags = "-x assembler -c"
+        elif assembler == "nasm":
+            assembler_flags = "-f elf64"
+        else:
+            raise NotImplementedError(f"Unsupported assembler: {assembler}")
+
+        print(f"using assembler {assembler} with flags: {assembler_flags}")
+
+        assembler_process = subprocess.run([assembler] + assembler_flags.split() + [assembly_file, '-o', obj_file], capture_output=True, text=True)
+        linker_process = subprocess.run(['gcc', '-no-pie', obj_file, '-o', output_file], capture_output=True, text=True)
+        output_messages = f"arm detected\nusing assembler {assembler}\n"
+        output_messages += f"assembler output:\n{assembler_process.stdout}\assembler error:\n{assembler_process.stderr}\n"
+        output_messages += f"linker output:\n{linker_process.stdout}\nlinker error:\n{linker_process.stderr}\n"
+
+        build_successful = assembler_process.returncode == 0 and linker_process.returncode == 0
+        if build_successful:
+            # Execute the binary and capture its output
+            execution_process = subprocess.run(['./' + output_file], capture_output=True, text=True)
+            output_messages += f"Execution:\n./{output_file}\n{execution_process.stdout}\n{execution_process.stderr}\n"
+
+        write_state_file(build_successful, output_messages, command)
+    except SyntaxError as se:
+        print(f"Syntax Error: {se}")
+        formatted_traceback = traceback.format_exc()
+        write_state_file(False, f"Traceback:\n{formatted_traceback}", command)
+    except Exception as e:
+        print(f"Error: {e}")
+        formatted_traceback = traceback.format_exc()
+        write_state_file(False, f"Traceback:\n{formatted_traceback}", command)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        print(f"Usage: python clam_compiler.py <input_file.clam> <output_binary> [--send]")
+        sys.exit(1)
+
+    input_file = sys.argv[1]
+    output_file = sys.argv[2]
+
+    prompt_gpt4 = None
+    send_gpt4 = False
+
+    if len(sys.argv) >= 4:
+        send_gpt4 = True
+
+    command = " ".join(sys.argv)
+    compile_clam_file(input_file, output_file, command)
+
+    if send_gpt4:
+        prompt = open('prompt.txt').read() + "\nSuggest a file to modify, and show the fixed version of the file.\n"
+        state = open('state.txt').read()
+        messages = [
+                {
+                    'role': 'system',
+                    'content': state
+                },
+                {
+                    'role': 'user',
+                    'content': prompt
+                }
+            ]
+
+        print(f'sending with prompt: {prompt}...')
+        response = openai.ChatCompletion.create(
+            model='gpt-4',
+            messages=messages,
+            stream=True
+        )
+
+        answer = ''
+        timestamp = datetime.datetime.now().strftime('%H_%M_%S')
+        response_filename = f"response_{timestamp}.md"
+        enc = tiktoken.get_encoding("cl100k_base")
+        num_setup_tokens = len(enc.encode(prompt)) + len(enc.encode(state))
+        
+        with open(response_filename, "w") as response_file:
+            for chunk in response:
+                try:
+                    s = chunk['choices'][0]['delta']['content']
+                    
+                    answer += s
+                    num_tokens = len(enc.encode(answer))
+                    print(s, end='')
+                    if '\n' in s:
+                        print(f'[{num_tokens+num_setup_tokens}/8192] ')
+                    
+                    response_file.write(s)
+                    response_file.flush() # ensure content is written to file immediately
+                except:
+                    pass
+
+        
+        enc = tiktoken.get_encoding("cl100k_base")
+        tokens = enc.encode(answer)
+        print(f"Response contained {len(tokens)} tokens")
+
+        for chunk in response:
+            try:
+                s = chunk['choices'][0]['delta']['content']
+                print(s, end='')
+                answer += s
+            except:
+                pass
+
+
+--- lexer.py ---
+import sys
+import re
+
+# Define your token types. You might have more types than this.
+TOKEN_TYPES = [
+    ('KEYWORD', r'\b(var|print|if)\b'),
+    ('IDENTIFIER', r'\b[a-zA-Z_][a-zA-Z0-9_]*\b'),
+    ('INTEGER', r'\b\d+\b'),
+    ('OPERATOR', r'[\+\-\*/]'),
+    ('EQUALS', r'='),
+    ('OPEN_PAREN', r'\('),
+    ('CLOSE_PAREN', r'\)'),
+    ('OPEN_BRACE', r'\{'),  # Add token type for '{'
+    ('CLOSE_BRACE', r'\}'),  # Add token type for '}'
+    ('NEWLINE', r'\n'),
+    ('SKIP', r'[ \t]'),
+    ('MISMATCH', r'.')
+]
+
+def lex(source_code: str):
+    pos = 0
+    tokens = []
+    while pos < len(source_code):
+        match = None
+        for token_type, regex in TOKEN_TYPES:
+            pattern = re.compile(regex)
+            match = pattern.match(source_code, pos)
+            if match:
+                text = match.group(0)
+                if token_type != 'SKIP':
+                    token = (token_type, text)
+                    tokens.append(token)
+                break
+        if not match:
+            raise ValueError(f'Illegal character: {source_code[pos]}')
+        else:
+            pos = match.end(0)
+    return tokens
+
+--- simple.clam ---
+var x = 10
+var y = 20
+print x + y
+print x - y
+if (x > y) {
+    var z = 6
+    print x + z
+    print y * z
+}
+
+--- tree_parser.py ---
+from lexer import lex
+
+class Node:
+    pass
+
+class VarDeclaration(Node):
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+
+class PrintStatement(Node):
+    def __init__(self, expression):
+        self.expression = expression
+
+class BinaryOperation(Node):
+    def __init__(self, left, operator, right):
+        self.left = left
+        self.operator = operator
+        self.right = right
+
+class Identifier(Node):
+    def __init__(self, name):
+        self.name = name
+
+class Integer(Node):
+    def __init__(self, value):
+        self.value = value
+
+class IfStatement(Node):
+    def __init__(self, condition: BinaryOperation, body):
+        self.condition = condition
+        self.body = body
+
+class SyntaxError(Exception):
+    pass
+
+def parse(tokens):
+    tokens = list(tokens)
+    statements = []
+
+    def parse_var_declaration():
+        token_type = tokens[0][0]
+        value = tokens[0][1]
+        if token_type == 'KEYWORD' and value == 'var':
+            _, name = tokens.pop(0)
+            _, _ = tokens.pop(0)
+            _, value = tokens.pop(0)
+            node = VarDeclaration(name, Integer(value))
+            statements.append(node)
+
+    def parse_print_statement():
+        _, name = tokens.pop(0)
+        if tokens and tokens[0][1] in ['+', '-', '*', '/']:
+            _, operator = tokens.pop(0)
+            _, right_value = tokens.pop(0)
+            node = PrintStatement(BinaryOperation(Identifier(name), operator, Identifier(right_value)))
+        else:
+            node = PrintStatement(Identifier(name))
+        statements.append(node)
+
+    def parse_if_statement():
+        _, _ = tokens.pop(0)  # Remove 'if' token
+        _, _ = tokens.pop(0)  # Remove '(' token
+        left_identifier, _ = tokens.pop(0)  # Get left identifier
+        operator, _ = tokens.pop(0)  # Get operator
+        right_identifier, _ = tokens.pop(0)  # Get right identifier
+        _, _ = tokens.pop(0)  # Remove ')' token
+        
+        condition = BinaryOperation(
+            Identifier(left_identifier), operator, Identifier(right_identifier)
+        )
+
+        # Parsing body of if statement
+        body = []
+        nest_level = 1
+        while nest_level > 0:
+            if not tokens:
+                raise SyntaxError("Mismatched braces in if statement")
+
+            token_type, value = tokens.pop(0)
+            if token_type == "OPEN_BRACE":
+                nest_level += 1
+            elif token_type == "CLOSE_BRACE":
+                nest_level -= 1
+            elif token_type == "KEYWORD":
+                if value == "var":
+                    parse_var_declaration()
+                elif value == "print":
+                    parse_print_statement()
+
+        node = IfStatement(condition, body)
+        statements.append(node)
+        
+    while tokens:
+        token_type, _ = tokens[0]
+
+        parse_var_declaration()
+        parse_print_statement()
+        parse_if_statement()
+
+    return statements
+
+Extra information:
+Output of 'uname -a': Linux oswald 5.19.0-41-generic #42~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Tue Apr 18 17:40:00 UTC 2 x86_64 x86_64 x86_64 GNU/Linux
+Current datetime: 2023-05-14 14:14:14
+
+Command used: clam.py simple.clam simple --send
+
+Build status: failed
+Build datetime: 2023-05-14 14:14:14
+
+Output messages:
+Traceback:
+Traceback (most recent call last):
+  File "/home/conor/sandbox/verby/clam.py", line 51, in compile_clam_file
+    syntax_tree = parse(tokens)
+  File "/home/conor/sandbox/verby/tree_parser.py", line 99, in parse
+    parse_if_statement()
+  File "/home/conor/sandbox/verby/tree_parser.py", line 78, in parse_if_statement
+    raise SyntaxError("Mismatched braces in if statement")
+tree_parser.SyntaxError: Mismatched braces in if statement
+
+
